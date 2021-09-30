@@ -2,6 +2,7 @@ import socket
 import traceback
 from typing import TextIO
 
+import trio
 import fire
 
 from .api import *
@@ -9,33 +10,25 @@ from .engine import *
 
 
 class SensorReader(Source):
-    reader: TextIO
+    stream: trio.SocketStream
 
-    def __init__(self, name: str, port: int):
+    def __init__(self, name: str, stream: trio.SocketStream):
         super().__init__(name)
-        self.reader = self._setup_socket_reader(port)
+        self.stream = stream
 
-    def get_events(self, event_collector: list[Event]):
-        try:
-            vehicle = self.reader.readline().strip()
-            if vehicle is None or vehicle == "":
-                raise Exception("Server is closed")
-            event_collector.append(VehicleEvent(vehicle))
-            print("")
-            print(f"SensorReader ---> {vehicle}")
-        except Exception as e:
-            print("Failed to read input")
-            print(traceback.format_exc())
-            raise e
+    @classmethod
+    async def create(cls, name: str, port: int) -> "SensorReader":
+        stream = await trio.open_tcp_stream("127.0.0.1", port)
+        return cls(name, stream)
 
-    def _setup_socket_reader(self, port: int) -> TextIO:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("127.0.0.1", port))
-            return sock.makefile("r")
-        except Exception as e:
-            print(traceback.format_exc())
-            raise e
+    async def get_events(self, event_collector: list[Event]):
+        data: bytes = await self.stream.receive_some()
+        if data is None or len(data) == 0:
+            raise trio.BrokenResourceError("\nTCP socket connection is closed")
+
+        vehicle = data.decode("utf-8").strip()
+        event_collector.append(VehicleEvent(vehicle))
+        print(f"\nSensorReader ---> {vehicle}")
 
 
 class VehicleEvent(Event):
@@ -69,11 +62,13 @@ class VehicleCounter(Operator):
         self.print_counts()
 
 
-def runner():
+async def runner():
     job = Job("vehicle_count")
 
-    bridge_stream = job.add_source(SensorReader("sensor-reader", 9000))
-    bridge_stream.apply_operator(VehicleCounter("vehicle-counter"))
+    reader = await SensorReader.create("sensor-reader", 9000)
+    bridge_stream = job.add_source(reader)
+    counter = VehicleCounter("vehicle-counter")
+    bridge_stream.apply_operator(counter)
 
     print(
         """
@@ -83,8 +78,15 @@ def runner():
     """
     )
     job_starter = JobStarter(job)
-    job_starter.start()
+    job_starter.setup()
+
+    async with trio.open_nursery() as nursery:
+        await job_starter.start(nursery)
+
+
+def main():
+    trio.run(runner)
 
 
 if __name__ == "__main__":
-    fire.Fire(runner)
+    fire.Fire(main)

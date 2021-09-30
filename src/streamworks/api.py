@@ -55,7 +55,7 @@ class Source(Component):
         super().__init__(name)
 
     @abstractmethod
-    def get_events(self, event_collector: list[Event]):
+    async def get_events(self, event_collector: list[Event]):
         pass
 
 

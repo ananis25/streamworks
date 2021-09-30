@@ -1,38 +1,24 @@
 from abc import abstractmethod
-from dataclasses import dataclass
-from queue import Queue
-from threading import Thread
+import trio
 
 from .api import *
 
 
 class Process:
-    _thread: Thread
-
-    def __init__(self):
-        self._thread = Thread(target=self._run, args=())
-
-    def _run(self):
-        while self.run_once():
-            pass
+    async def run(self):
+        while await self.run_once():
+            await self.run_once()
 
     @abstractmethod
-    def run_once(self) -> bool:
+    async def run_once(self) -> bool:
         pass
-
-    def start(self):
-        self._thread.start()
-
-
-class EventQueue(Queue):
-    serial_version_uid: int = 3673430816396878407
 
 
 class ComponentExecutor(Process):
     _component: Component
     _event_collector: list[Event]
-    _incoming_queue: EventQueue = None
-    _outgoing_queue: EventQueue = None
+    _incoming_queue: trio.MemoryReceiveChannel = None
+    _outgoing_queue: trio.MemorySendChannel = None
 
     def __init__(self, component: Component):
         super().__init__()
@@ -42,10 +28,10 @@ class ComponentExecutor(Process):
     def get_component(self) -> Component:
         return self._component
 
-    def set_incoming_queue(self, queue: EventQueue) -> None:
+    def set_incoming_queue(self, queue: trio.MemoryReceiveChannel) -> None:
         self._incoming_queue = queue
 
-    def set_outgoing_queue(self, queue: EventQueue) -> None:
+    def set_outgoing_queue(self, queue: trio.MemorySendChannel) -> None:
         self._outgoing_queue = queue
 
 
@@ -56,22 +42,27 @@ class OperatorExecutor(ComponentExecutor):
         super().__init__(operator)
         self._operator = operator
 
-    def run_once(self) -> bool:
+    async def run_once(self) -> bool:
         try:
-            event = self._incoming_queue.get()
-        except Exception as e:
-            # TODO: find a better parallel to Java InterruptedException for python.
-            # Python doesn't seem to have a simple mechanism to interrupt threads
-            return False
-
-        self._operator.apply(event, self._event_collector)
-
-        try:
-            for output in self._event_collector:
-                self._outgoing_queue.put(output)
+            event = await self._incoming_queue.receive()
+            self._operator.apply(event, self._event_collector)
+            if self._outgoing_queue is not None:
+                for output in self._event_collector:
+                    await self._outgoing_queue.send(output)
             self._event_collector.clear()
-        except Exception as e:
+        except trio.EndOfChannel:
+            print(
+                f"Incoming channel closed. Operator: {self.get_component().get_name()} is shutting down."
+            )
+            self._incoming_queue.close()
+            if self._outgoing_queue is not None:
+                self._outgoing_queue.close()
             return False
+        except Exception as e:
+            self._incoming_queue.close()
+            if self._outgoing_queue is not None:
+                self._outgoing_queue.close()
+            raise e
 
         return True
 
@@ -83,23 +74,26 @@ class SourceExecutor(ComponentExecutor):
         super().__init__(src)
         self._source = src
 
-    def run_once(self) -> bool:
+    async def run_once(self) -> bool:
         try:
-            self._source.get_events(self._event_collector)
-        except Exception as e:
-            # TODO: find a way to coordinate among threads in python
-            return False
-
-        try:
+            await self._source.get_events(self._event_collector)
             for event in self._event_collector:
-                self._outgoing_queue.put(event)
+                await self._outgoing_queue.send(event)
             self._event_collector.clear()
-        except Exception as e:
+        except trio.BrokenResourceError as e:
+            print(str(e))
+            print(
+                f"Incoming channel closed. Source: {self.get_component().get_name()} is shutting down."
+            )
+            self._outgoing_queue.close()
             return False
+        except Exception as e:
+            self._outgoing_queue.close()
+            raise e
 
         return True
 
-    def set_incoming_queue(self, queue: EventQueue) -> None:
+    def set_incoming_queue(self, queue: trio.MemoryReceiveChannel) -> None:
         raise RuntimeError("no incoming queue allowed for a source executor")
 
 
@@ -123,13 +117,9 @@ class JobStarter:
         self._connection_list = []
         self._executor_list = []
 
-    def start(self):
+    def setup(self):
         self.setup_component_executors()
         self.setup_connections()
-
-        self.start_processes()
-
-        # TODO: start web server
 
     def setup_component_executors(self):
         for src in self._job.get_sources():
@@ -141,14 +131,14 @@ class JobStarter:
         for conn in self._connection_list:
             self.connect_executors(conn)
 
-    def start_processes(self):
+    async def start(self, nursery: trio.Nursery):
         for executor in reversed(self._executor_list):
-            executor.start()
+            nursery.start_soon(executor.run)
 
     def connect_executors(self, conn: Connection):
-        inter_queue = EventQueue(self._queue_size)
-        conn.from_.set_outgoing_queue(inter_queue)
-        conn.to_.set_incoming_queue(inter_queue)
+        send_channel, recv_channel = trio.open_memory_channel(self._queue_size)
+        conn.from_.set_outgoing_queue(send_channel)
+        conn.to_.set_incoming_queue(recv_channel)
 
     def traverse_component(
         self, component: Component, comp_executor: ComponentExecutor
