@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 
 
 class Event(ABC):
@@ -11,9 +11,11 @@ class Event(ABC):
 class Component:
     _name: str
     _outgoing_stream: "Stream"
+    _parallelism: int
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, parallelism: int):
         self._name = name
+        self._parallelism = parallelism
         self._outgoing_stream = Stream()
 
     def get_name(self) -> str:
@@ -22,14 +24,37 @@ class Component:
     def get_outgoing_stream(self) -> "Stream":
         return self._outgoing_stream
 
+    def get_parallelism(self) -> int:
+        return self._parallelism
+
+    @abstractmethod
+    def clone(self) -> "Component":
+        pass
+
 
 class Operator(Component):
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
+    grouping: "GroupingStrategy"
+
+    def __init__(
+        self, name: str, parallelism: int, grouping: "GroupingStrategy" = None
+    ) -> None:
+        super().__init__(name, parallelism)
+        self.grouping = ShuffleGrouping() if not grouping else grouping
+
+    @abstractmethod
+    def clone(self) -> "Operator":
+        pass
+
+    @abstractmethod
+    async def setup_instance(self, instance: int):
+        pass
 
     @abstractmethod
     def apply(self, event: Event, event_collector: list[Event]):
         pass
+
+    def get_grouping_strategy(self) -> "GroupingStrategy":
+        return self.grouping
 
 
 class Stream:
@@ -51,8 +76,16 @@ class Stream:
 
 
 class Source(Component):
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
+    def __init__(self, name: str, parallelism: int) -> None:
+        super().__init__(name, parallelism)
+
+    @abstractmethod
+    def clone(self) -> "Source":
+        pass
+
+    @abstractmethod
+    async def setup_instance(self, instance: int):
+        pass
 
     @abstractmethod
     async def get_events(self, event_collector: list[Event]):
@@ -79,3 +112,29 @@ class Job:
 
     def get_sources(self) -> Iterable[Source]:
         return self._source_set
+
+
+class GroupingStrategy(Protocol):
+    def get_instance(self, event: Event, parallelism: int) -> int:
+        pass
+
+
+class FieldsGrouping:
+    def get_key(self, event: Event) -> Any:
+        return event.get_data()
+
+    def get_instance(self, event: Event, parallelism: int) -> int:
+        return abs(hash(self.get_key(event))) % parallelism
+
+
+class ShuffleGrouping:
+    count: int
+
+    def __init__(self):
+        self.count = 0
+
+    def get_instance(self, event: Event, parallelism: int) -> int:
+        if self.count >= parallelism:
+            self.count = 0
+        self.count += 1
+        return self.count - 1
