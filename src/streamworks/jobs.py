@@ -1,9 +1,4 @@
-import socket
-import traceback
-from typing import TextIO
-
 import trio
-import fire
 
 from .api import *
 from .engine import *
@@ -75,7 +70,7 @@ class VehicleCounter(Operator):
         self.print_counts()
 
 
-async def runner():
+async def runner_1():
     job = Job("vehicle_count")
 
     reader = SensorReader("sensor-reader", 2, 9000)
@@ -97,8 +92,53 @@ async def runner():
         await job_starter.start(nursery)
 
 
+async def runner_2():
+    job = Job("vehicle_count")
+
+    reader = SensorReader("sensor-reader", 2, 9000)
+    bridge_stream = job.add_source(reader)
+    counter = VehicleCounter("vehicle-counter", 2)
+    bridge_stream.apply_operator(counter)
+
+    print(
+        """
+    This is a streaming job that counts the number of vehicles from 2 input streams, into 2 counters. 
+
+    Enter the type of each new vechicle in the input terminal and check back here for the current counts.
+    """
+    )
+    job_starter = JobStarter(job)
+    await job_starter.setup()
+
+    async with trio.open_nursery() as nursery:
+        await job_starter.start(nursery)
+
+
+async def runner_3():
+    job = Job("vehicle_count")
+
+    reader = SensorReader("sensor-reader", 2, 9000)
+    bridge_stream = job.add_source(reader)
+    counter = VehicleCounter("vehicle-counter", 2, FieldsGrouping())
+    bridge_stream.apply_operator(counter)
+
+    print(
+        """
+    This is a streaming job that counts the number of vehicles from 2 input streams, into 2 counters with Field grouping. 
+    Events of the same type are always routed to the same counter. 
+
+    Enter the type of each new vechicle in the input terminal and check back here for the current counts.
+    """
+    )
+    job_starter = JobStarter(job)
+    await job_starter.setup()
+
+    async with trio.open_nursery() as nursery:
+        await job_starter.start(nursery)
+
+
 def main():
-    trio.run(runner)
+    trio.run(runner_3)
 
 
 if __name__ == "__main__":
