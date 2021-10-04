@@ -3,9 +3,41 @@ from typing import Any, Iterable, Protocol
 
 
 class Event(ABC):
-    @abstractmethod
-    def get_data(self) -> Any:
-        pass
+    pass
+
+
+class EventCollector:
+    """
+    Accept events from components, put them in the specified channel
+    """
+
+    _queues: dict[str, list[Event]]
+    _channels_regd: set[str]
+
+    def __init__(self):
+        self._queues = dict()
+        self._channels_regd = set()
+
+    def register_channel(self, channel: str):
+        # always make sure registration is idempotent
+        if channel not in self._channels_regd:
+            self._channels_regd.add(channel)
+            self._queues[channel] = []
+
+    def add(self, channel: str, event: Event):
+        if channel not in self._queues:
+            self.register_channel(channel)
+        self._queues[channel].append(event)
+
+    def get_registered_channels(self):
+        return self._channels_regd
+
+    def get_list_events(self, channel: str):
+        return self._queues[channel]
+
+    def clear(self):
+        for queue in self._queues.values():
+            queue.clear()
 
 
 class Component:
@@ -43,7 +75,7 @@ class Operator(Component):
 
     @abstractmethod
     def clone(self) -> "Operator":
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     async def setup_instance(self, instance: int):
@@ -57,22 +89,63 @@ class Operator(Component):
         return self.grouping
 
 
+class StreamChannel:
+    base_stream: "Stream"
+    channel: str
+
+    def __init__(self, stream: str, channel: str):
+        self.base_stream = stream
+        self.channel = channel
+
+    def apply_operator(self, operator: "Operator"):
+        return self.base_stream.apply_operator(operator, channel=self.channel)
+
+
 class Stream:
-    # TODO: should this be a set? We need an order dont we?
-    _operator_set: set[Operator]
+    _operator_map: dict[str, set[Operator]]
 
     def __init__(self):
-        self._operator_set = set()
+        self._operator_map = dict()
 
-    def apply_operator(self, operator: "Operator") -> "Stream":
-        if operator in self._operator_set:
-            raise RuntimeError(f"Operator {operator} already added to the job")
+    def apply_operator(
+        self, operator: "Operator", channel: str = "default"
+    ) -> "Stream":
+        if channel not in self._operator_map:
+            self._operator_map[channel] = set()
 
-        self._operator_set.add(operator)
+        op_set = self._operator_map[channel]
+        if operator in op_set:
+            raise RuntimeError(
+                f"Operator {operator} already added to the channel: {channel}"
+            )
+        else:
+            op_set.add(operator)
         return operator.get_outgoing_stream()
 
-    def get_applied_operators(self) -> Iterable[Operator]:
-        return self._operator_set
+    def select_channel(self, channel: str):
+        return StreamChannel(self, channel)
+
+    def get_channels(self) -> list[str]:
+        return list(self._operator_map.keys())
+
+    def get_applied_operators(self, channel: str) -> Iterable[Operator]:
+        return self._operator_map[channel]
+
+
+class Streams:
+    streams: list[Stream]
+
+    def __init__(self, streams: list[Stream]):
+        self.streams = streams
+
+    @classmethod
+    def of_(cls, streams: Iterable[Stream]):
+        return cls([s for s in streams])
+
+    def apply_operator(self, operator: Operator):
+        for stream in self.streams:
+            stream.apply_operator(operator)
+        return operator.get_outgoing_stream()
 
 
 class Source(Component):
@@ -120,8 +193,9 @@ class GroupingStrategy(Protocol):
 
 
 class FieldsGrouping:
+    @abstractmethod
     def get_key(self, event: Event) -> Any:
-        return event.get_data()
+        raise NotImplementedError
 
     def get_instance(self, event: Event, parallelism: int) -> int:
         return abs(hash(self.get_key(event))) % parallelism

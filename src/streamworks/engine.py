@@ -1,7 +1,19 @@
 from abc import abstractmethod
+import json
+
 import trio
+from hypercorn.config import Config
+from hypercorn.trio import serve
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.routing import Route
 
 from .api import *
+
+# alias the trio memory channel types so we don't conflate them with the concept of a `channel`
+# in our streaming engine
+SEND_QUEUE = trio.MemorySendChannel
+RECV_QUEUE = trio.MemoryReceiveChannel
 
 
 class Process:
@@ -29,28 +41,40 @@ class ComponentExecutor:
     def get_instance_executors(self) -> list["InstanceExecutor"]:
         return self._instance_executors
 
-    def set_incoming_queues(self, queues: list[trio.MemoryReceiveChannel]) -> None:
+    def register_channel(self, channel: str):
+        for executor in self._instance_executors:
+            executor.register_channel(channel)
+
+    def set_incoming_queues(self, queues: list[RECV_QUEUE]) -> None:
         for idx, queue in enumerate(queues):
             self._instance_executors[idx].set_incoming_queue(queue)
 
-    def set_outgoing_queue(self, queue: trio.MemorySendChannel) -> None:
+    def add_outgoing_queue(self, channel: str, queue: SEND_QUEUE) -> None:
         for executor in self._instance_executors:
-            executor.set_outgoing_queue(queue)
+            executor.add_outgoing_queue(channel, queue)
 
 
 class InstanceExecutor(Process):
-    _event_collector: list[Event]
-    _incoming_queue: trio.MemoryReceiveChannel = None
-    _outgoing_queue: trio.MemorySendChannel = None
+    _event_collector: EventCollector
+    _incoming_queue: RECV_QUEUE
+    _outgoing_queue_map: dict[str, list[SEND_QUEUE]]
 
     def __init__(self):
-        self._event_collector = []
+        self._event_collector = EventCollector()
+        self._incoming_queue = None
+        self._outgoing_queue_map = dict()
 
-    def set_incoming_queue(self, queue: trio.MemoryReceiveChannel) -> None:
+    def register_channel(self, channel: str):
+        if channel not in self._outgoing_queue_map:
+            self._outgoing_queue_map[channel] = []
+
+    def set_incoming_queue(self, queue: RECV_QUEUE) -> None:
         self._incoming_queue = queue
 
-    def set_outgoing_queue(self, queue: trio.MemorySendChannel) -> None:
-        self._outgoing_queue = queue
+    def add_outgoing_queue(self, channel: str, queue: SEND_QUEUE) -> None:
+        if channel not in self._outgoing_queue_map:
+            self.register_channel(channel)
+        self._outgoing_queue_map[channel].append(queue)
 
 
 class OperatorInstanceExecutor(InstanceExecutor):
@@ -72,16 +96,19 @@ class OperatorInstanceExecutor(InstanceExecutor):
 
     def _shutdown(self):
         self._incoming_queue.close()
-        if self._outgoing_queue is not None:
-            self._outgoing_queue.close()
+        for _, queues in self._outgoing_queue_map.items():
+            for queue in queues:
+                queue.close()
 
     async def run_once(self) -> bool:
         try:
             event = await self._incoming_queue.receive()
             self._operator.apply(event, self._event_collector)
-            if self._outgoing_queue is not None:
-                for output in self._event_collector:
-                    await self._outgoing_queue.send(output)
+
+            for channel in self._event_collector.get_registered_channels():
+                for output in self._event_collector.get_list_events(channel):
+                    for queue in self._outgoing_queue_map[channel]:
+                        await queue.send(output)
             self._event_collector.clear()
         except trio.EndOfChannel:
             print(f"Incoming channel closed. {self} is shutting down.")
@@ -113,12 +140,12 @@ class OperatorExecutor(ComponentExecutor):
             instance_executors.append(executor)
         return cls(operator, instance_executors)
 
-    def get_grouping_strategy(self) -> GroupingStrategy:
-        return self._operator.get_grouping_strategy()
-
     async def run(self, nursery: trio.Nursery):
         for instance in self._instance_executors:
             nursery.start_soon(instance.run)
+
+    def get_grouping_strategy(self) -> GroupingStrategy:
+        return self._operator.get_grouping_strategy()
 
 
 class SourceInstanceExecutor(InstanceExecutor):
@@ -139,14 +166,18 @@ class SourceInstanceExecutor(InstanceExecutor):
         return f"source: {self._source.get_name()}, instance: {self._instance_id}"
 
     def _shutdown(self):
-        # TODO: hmm do we need to close all the outgoing queues, or will the others take care of themselves?
-        self._outgoing_queue.close()
+        for _, queues in self._outgoing_queue_map.items():
+            for queue in queues:
+                queue.close()
 
     async def run_once(self) -> bool:
         try:
             await self._source.get_events(self._event_collector)
-            for event in self._event_collector:
-                await self._outgoing_queue.send(event)
+
+            for channel in self._event_collector.get_registered_channels():
+                for output in self._event_collector.get_list_events(channel):
+                    for queue in self._outgoing_queue_map.get(channel, []):
+                        await queue.send(output)
             self._event_collector.clear()
         except trio.BrokenResourceError as e:
             print(str(e))
@@ -181,33 +212,35 @@ class SourceExecutor(ComponentExecutor):
         for instance in self._instance_executors:
             nursery.start_soon(instance.run)
 
-    def set_incoming_queues(self, queue: trio.MemoryReceiveChannel) -> None:
+    def set_incoming_queues(self, queue: RECV_QUEUE) -> None:
         raise RuntimeError("no incoming queue allowed for a source executor")
 
 
 class Connection:
     from_: ComponentExecutor
     to_: OperatorExecutor
+    channel: str
 
-    def __init__(self, from_: ComponentExecutor, to_: OperatorExecutor):
+    def __init__(self, from_: ComponentExecutor, to_: OperatorExecutor, channel: str):
         self.from_ = from_
         self.to_ = to_
+        self.channel = channel
 
 
 class EventDispatcher(Process):
     _downstream_executor: OperatorExecutor
-    _incoming_queue: trio.MemoryReceiveChannel
-    _outgoing_queues: list[trio.MemorySendChannel]
+    _incoming_queue: RECV_QUEUE
+    _outgoing_queues: list[SEND_QUEUE]
 
     def __init__(self, op_executor: OperatorExecutor):
         self._downstream_executor = op_executor
         self._incoming_queue = None
         self._outgoing_queues = []
 
-    def set_incoming_queue(self, queue: trio.MemoryReceiveChannel):
+    def set_incoming_queue(self, queue: RECV_QUEUE):
         self._incoming_queue = queue
 
-    def set_outgoing_queues(self, queues: list[trio.MemorySendChannel]):
+    def set_outgoing_queues(self, queues: list[SEND_QUEUE]):
         self._outgoing_queues = queues
 
     async def run_once(self) -> bool:
@@ -229,16 +262,23 @@ class JobStarter:
     _executor_list: list[ComponentExecutor]
     _dispatcher_list: list[EventDispatcher]
     _connection_list: list[Connection]
+    _operator_map: dict[Operator, OperatorExecutor]
+    _operator_queue_map: dict[OperatorExecutor, SEND_QUEUE]  # TODO: check queue type
+    _server: "WebServer"
 
     def __init__(self, job: Job):
         self._job = job
         self._connection_list = []
         self._dispatcher_list = []
         self._executor_list = []
+        self._operator_map = dict()
+        self._operator_queue_map = dict()
+        self._server = WebServer(job.get_name())
 
     async def setup(self):
         await self.setup_component_executors()
         self.setup_connections()
+        self._server.setup(self._connection_list)
 
     async def setup_component_executors(self):
         for src in self._job.get_sources():
@@ -255,6 +295,9 @@ class JobStarter:
             nursery.start_soon(executor.run, nursery)
         for dispatcher in self._dispatcher_list:
             nursery.start_soon(dispatcher.run)
+        nursery.start_soon(
+            serve, self._server, Config.from_mapping({"bind": "127.0.0.1:9010"})
+        )
 
     def connect_executors(self, conn: Connection):
         """
@@ -263,28 +306,134 @@ class JobStarter:
         routes them to n queues per the grouping strategy for the downstream component,
         1 queue per instance.
         """
-        dispatcher = EventDispatcher(conn.to_)
-        self._dispatcher_list.append(dispatcher)
+        conn.from_.register_channel(conn.channel)
+        if conn.to_ in self._operator_queue_map:
+            dispatch_queue = self._operator_queue_map[conn.to_]
+            conn.from_.add_outgoing_queue(conn.channel, dispatch_queue)
+        else:
+            # upstream connections
+            upstream_send, upstream_recv = trio.open_memory_channel(self._queue_size)
+            conn.from_.add_outgoing_queue(conn.channel, upstream_send)
+            dispatcher = EventDispatcher(conn.to_)
+            dispatcher.set_incoming_queue(upstream_recv)
+            self._operator_queue_map[conn.to_] = upstream_send
 
-        upstream_send, upstream_recv = trio.open_memory_channel(self._queue_size)
-        conn.from_.set_outgoing_queue(upstream_send)
-        dispatcher.set_incoming_queue(upstream_recv)
+            # downstream connections
+            downstream_queues = [
+                trio.open_memory_channel(self._queue_size)
+                for _ in range(conn.to_.get_component().get_parallelism())
+            ]
+            dispatcher.set_outgoing_queues(
+                [channel[0] for channel in downstream_queues]
+            )
+            conn.to_.set_incoming_queues([channel[1] for channel in downstream_queues])
 
-        downstream_channels = [
-            trio.open_memory_channel(self._queue_size)
-            for _ in range(conn.to_.get_component().get_parallelism())
-        ]
-        dispatcher.set_outgoing_queues([channel[0] for channel in downstream_channels])
-        conn.to_.set_incoming_queues([channel[1] for channel in downstream_channels])
+            # add to the list
+            self._dispatcher_list.append(dispatcher)
 
     async def traverse_component(
         self, component: Component, comp_executor: ComponentExecutor
     ):
         stream = component.get_outgoing_stream()
-        for operator in stream.get_applied_operators():
-            op_executor = await OperatorExecutor.create(operator)
-            self._executor_list.append(op_executor)
-            self._connection_list.append(
-                Connection(from_=comp_executor, to_=op_executor)
+        for channel in stream.get_channels():
+            for operator in stream.get_applied_operators(channel):
+                if operator in self._operator_map:
+                    op_executor = self._operator_map[operator]
+                else:
+                    op_executor = await OperatorExecutor.create(operator)
+                    self._operator_map[operator] = op_executor
+                    self._executor_list.append(op_executor)
+                    await self.traverse_component(operator, op_executor)
+
+                self._connection_list.append(
+                    Connection(from_=comp_executor, to_=op_executor, channel=channel)
+                )
+
+
+class Node:
+    name: str
+    parallelism: str
+
+    def __init__(self, name: str, parallelism: int):
+        self.name = name
+        self.parallelism = str(parallelism)
+
+    def get_json(self):
+        return {"name": self.name, "parallelism": self.parallelism}
+
+
+class Edge:
+    from_: str
+    to_: str
+    stream: str
+    from_parallelism: str
+    to_parallelism: str
+
+    def __init__(self, from_: Node, to_: Node, stream: str):
+        self.from_ = from_.name
+        self.to_ = to_.name
+        self.stream = stream
+        self.from_parallelism = from_.parallelism
+        self.to_parallelism = to_.parallelism
+
+    def get_json(self):
+        return {
+            "from": f"{self.from_} x{self.from_parallelism}",
+            "to": f"{self.to_} x{self.to_parallelism}",
+            "stream": self.stream,
+        }
+
+
+class WebServer(Starlette):
+    job_name: str
+    sources: list[Node]
+    operators: list[Node]
+    edges: list[Edge]
+
+    def __init__(self, job_name: str):
+        """thanks to https://github.com/encode/starlette/issues/811#issuecomment-900579064"""
+        super().__init__(
+            routes=[Route("/", self.index), Route("/plan.json", self.plan)]
+        )
+        self.job_name = job_name
+        self.sources = []
+        self.operators = []
+        self.edges = []
+
+    def setup(self, connections: list[Connection]):
+        incoming_counts: dict[Node, int] = dict()
+        for conn in connections:
+            from_ = Node(
+                conn.from_.get_component().get_name(),
+                conn.from_.get_component().get_parallelism(),
             )
-            await self.traverse_component(operator, op_executor)
+            to_ = Node(
+                conn.to_.get_component().get_name(),
+                conn.to_.get_component().get_parallelism(),
+            )
+            incoming_counts[from_] = incoming_counts.get(from_, 0)
+            incoming_counts[to_] = incoming_counts.get(to_, 0) + 1
+            self.edges.append(Edge(from_, to_, conn.channel))
+
+        for node, count in incoming_counts.items():
+            if count == 0:
+                self.sources.append(node)
+            else:
+                self.operators.append(node)
+
+    async def plan(self, request):
+        plan = {
+            "job": self.job_name,
+            "sources": [s.get_json() for s in self.sources],
+            "operators": [op.get_json() for op in self.operators],
+            "edges": [edge.get_json() for edge in self.edges],
+        }
+        return PlainTextResponse(json.dumps(plan, indent=2), status_code=200)
+
+    async def index(self, request):
+        graph = [self.job_name]
+        for edge in self.edges:
+            graph.append(
+                f"{edge.from_} x{edge.from_parallelism} --> | {edge.stream} | {edge.to_} x{edge.to_parallelism}"
+            )
+        return PlainTextResponse("\n".join(graph), status_code=200)

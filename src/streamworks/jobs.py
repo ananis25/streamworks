@@ -1,10 +1,196 @@
+import uuid
+import warnings
+from datetime import datetime
+from dataclasses import dataclass
 import trio
 
 from .api import *
 from .engine import *
 
 
-class SensorReader(Source):
+@dataclass
+class TransactionEvent(Event):
+    transaction_id: str
+    amount: float
+    transaction_time: datetime
+    merchandise_id: int
+    user_account: int
+
+    def __post_init__(self):
+        super().__init__()
+
+    def __repr__(self):
+        return f"[transaction:{self.transaction_id}, amount:{self.amount}, time:{self.transaction_time.strftime('%Y-%m-%d %H:%M:%S')}, merchandise: {self.merchandise_id}, user: {self.user_account}]"
+
+
+@dataclass
+class TransactionScoreEvent(Event):
+    transaction: TransactionEvent
+    score: float
+
+
+class AvgTicketAnalyzer(Operator):
+    _instance_id: int
+
+    def __init__(self, name: int, parallelism: int, grouping: GroupingStrategy):
+        super().__init__(name, parallelism, grouping)
+
+    async def setup_instance(self, instance: int):
+        self._instance_id = instance
+
+    def clone(self):
+        return self.__class__(
+            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
+        )
+
+    def apply(trx: Event, event_collector: EventCollector):
+        assert isinstance(
+            trx, TransactionEvent
+        ), f"unfamiliar event of type: {type(trx)}"
+        return TransactionScoreEvent(trx, 0.0)
+
+
+class Bridge(Source):
+    _instance_id: int
+    base_port: int
+    flag_clone: bool
+    stream: trio.SocketStream
+
+    def __init__(self, name: str, parallelism: int, base_port: int, clone: bool):
+        super().__init__(name, parallelism)
+        self.base_port = base_port
+        self.flag_clone = clone
+
+    def clone(self):
+        return self.__class__(
+            self.get_name(), self.get_parallelism(), self.base_port, self.flag_clone
+        )
+
+    async def setup_instance(self, instance_id: int) -> None:
+        self._instance_id = instance_id
+        self.stream = await trio.open_tcp_stream(
+            "127.0.0.1", self.base_port + instance_id
+        )
+
+    async def get_events(self, event_collector: EventCollector):
+        data: bytes = await self.stream.receive_some()
+        if data is None or len(data) == 0:
+            raise trio.BrokenResourceError("\nTCP socket connection is closed")
+
+        vehicle = data.decode("utf-8").strip()
+        event_collector.add("default", VehicleEvent(vehicle))
+        if self.flag_clone:
+            event_collector.add("clone", VehicleEvent(f"{vehicle} clone"))
+
+        print(
+            f"\nBridge ({self.get_name()}) :: instance {self._instance_id} ---> {vehicle}"
+        )
+
+
+class ScoreAggregator(Operator):
+    _instance_id: int
+    _store: "ScoreStorage"
+
+    def __init__(
+        self,
+        name: str,
+        parallelism: int,
+        grouping: GroupingStrategy,
+        store: "ScoreStorage",
+    ):
+        super().__init__(name, parallelism, grouping)
+        self._store = store
+
+    async def setup_instance(self, instance_id: int):
+        self._instance_id = instance_id
+
+    def clone(self):
+        return self.__class__(
+            self.get_name(),
+            self.get_parallelism(),
+            self.get_grouping_strategy(),
+            ScoreStorage(),
+        )
+
+    def apply(self, trx: TransactionScoreEvent, event_collector: EventCollector):
+        assert isinstance(trx, TransactionScoreEvent)
+        old_score = self._store.get(trx.transaction.transaction_id, 0)
+        self._store.put(trx.transaction.transaction_id, old_score + trx.score)
+
+
+class ScoreStorage:
+    trx_scores: dict[str, float]
+
+    def __init__(self):
+        self.trx_scores = dict()
+
+    def get(self, trx: str, default_val: float):
+        return self.trx_scores.get(trx, default_val)
+
+    def put(self, trx: str, value: float):
+        print(f"Transaction score change: {trx} ==> {value}")
+        self.trx_scores[trx] = value
+
+
+class VehicleEvent(Event):
+    type_: str
+
+    def __init__(self, type_: str):
+        self.type_ = type_
+
+    def get_type(self) -> str:
+        return self.type_
+
+
+class TollBooth(Operator):
+    _instance_id: int
+    counts: dict[str, int]
+
+    def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy = None):
+        super().__init__(name, parallelism, grouping)
+        self.counts = dict()
+
+    def clone(self):
+        return self.__class__(
+            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
+        )
+
+    async def setup_instance(self, instance_id: int) -> None:
+        self._instance_id = instance_id
+
+    def apply(self, event: VehicleEvent, event_collector: EventCollector):
+        vehicle = event.get_type()
+        assert isinstance(vehicle, str), "Unexpected vehicle type encountered"
+
+        self.counts[vehicle] = self.counts.get(vehicle, 0) + 1
+        print(
+            f"Toll booth ({self.get_name()}) :: instance {self._instance_id} ==>",
+            end="  ",
+        )
+        for vehicle, count in self.counts.items():
+            print(f"{vehicle}: {count}", end=", ")
+        print("", flush=True)
+
+
+class TransactionFieldsGrouping(FieldsGrouping):
+    def get_key(self, event: TransactionScoreEvent):
+        assert isinstance(event, TransactionScoreEvent)
+        return event.transaction.transaction_id
+
+
+class UserAccountFieldsGrouping(FieldsGrouping):
+    def get_key(self, event: TransactionEvent):
+        assert isinstance(event, TransactionEvent)
+        return event.transaction_id
+
+
+class VehicleTypeFieldsGrouping(FieldsGrouping):
+    def get_key(self, event: VehicleEvent) -> Any:
+        assert isinstance(event, VehicleEvent)
+        return event.get_type()
+
+
+class TransactionSource(Source):
     _instance_id: int
     base_port: int
     stream: trio.SocketStream
@@ -14,7 +200,7 @@ class SensorReader(Source):
         self.base_port = base_port
 
     def clone(self):
-        return self.__class__(self._name, self._parallelism, self.base_port)
+        return self.__class__(self.get_name(), self.get_parallelism(), self.base_port)
 
     async def setup_instance(self, instance_id: int) -> None:
         self._instance_id = instance_id
@@ -22,124 +208,64 @@ class SensorReader(Source):
             "127.0.0.1", self.base_port + instance_id
         )
 
-    async def get_events(self, event_collector: list[Event]):
+    async def get_events(self, event_collector: EventCollector):
         data: bytes = await self.stream.receive_some()
         if data is None or len(data) == 0:
             raise trio.BrokenResourceError("\nTCP socket connection is closed")
 
-        vehicle = data.decode("utf-8").strip()
-        event_collector.append(VehicleEvent(vehicle))
-        print(f"\nSensorReader :: instance {self._instance_id} ---> {vehicle}")
+        trx = data.decode("utf-8").strip()
+        try:
+            values = trx.split(",")
+            amount = float(values[0])
+            merchandise_id = int(values[1])
+        except:
+            warnings.warn(f"Invalid input transaction: {trx}", RuntimeWarning)
+            return
+
+        user_account = 1
+        trx_id = uuid.uuid4().hex
+        trx_time = datetime.now()
+        event = TransactionEvent(trx_id, amount, trx_time, merchandise_id, user_account)
+        event_collector.add("default", event)
+
+        print(
+            f"\nTransaction ({self.get_name()}) :: instance {self._instance_id} ---> {event}"
+        )
 
 
-class VehicleEvent(Event):
-    type_: str
-
-    def __init__(self, type_: str):
-        self.type_ = type_
-
-    def get_data(self) -> str:
-        return self.type_
-
-
-class VehicleCounter(Operator):
+class WindowedProximityAnalyzer(Operator):
     _instance_id: int
-    counts: dict[str, int]
 
-    def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy = None):
+    def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy):
         super().__init__(name, parallelism, grouping)
-        self.counts = dict()
 
     def clone(self):
-        return self.__class__(self._name, self._parallelism, self.grouping)
+        return self.__class__(
+            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
+        )
 
-    async def setup_instance(self, instance_id: int) -> None:
+    async def setup_instance(self, instance_id: int):
         self._instance_id = instance_id
 
-    def print_counts(self):
-        for vehicle, count in self.counts.items():
-            print(f"{vehicle}: {count}", end=", ")
-        print("", flush=True)
-
-    def apply(self, event: VehicleEvent, event_collector: list[Event]):
-        vehicle = event.get_data()
-        assert isinstance(vehicle, str), "Unexpected vehicle type encountered"
-
-        self.counts[vehicle] = self.counts.get(vehicle, 0) + 1
-        print(f"VEHICLE COUNTER :: instance {self._instance_id} -->", end="  ")
-        self.print_counts()
+    def apply(trx: TransactionEvent, event_collector: EventCollector):
+        assert isinstance(trx, TransactionEvent)
+        event_collector.add("default", TransactionScoreEvent(trx, 0.0))
 
 
-async def runner_1():
-    job = Job("vehicle_count")
+class WindowedTransactionCountAnalyzer(Operator):
+    _instance_id: int
 
-    reader = SensorReader("sensor-reader", 2, 9000)
-    bridge_stream = job.add_source(reader)
-    counter = VehicleCounter("vehicle-counter", 1)
-    bridge_stream.apply_operator(counter)
+    def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy):
+        super().__init__(name, parallelism, grouping)
 
-    print(
-        """
-    This is a streaming job that counts the number of vehicles from 2 input streams. 
+    def clone(self):
+        return self.__class__(
+            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
+        )
 
-    Enter the type of each new vechicle in the input terminal and check back here for the current counts.
-    """
-    )
-    job_starter = JobStarter(job)
-    await job_starter.setup()
+    async def setup_instance(self, instance_id: int):
+        self._instance_id = instance_id
 
-    async with trio.open_nursery() as nursery:
-        await job_starter.start(nursery)
-
-
-async def runner_2():
-    job = Job("vehicle_count")
-
-    reader = SensorReader("sensor-reader", 2, 9000)
-    bridge_stream = job.add_source(reader)
-    counter = VehicleCounter("vehicle-counter", 2)
-    bridge_stream.apply_operator(counter)
-
-    print(
-        """
-    This is a streaming job that counts the number of vehicles from 2 input streams, into 2 counters. 
-
-    Enter the type of each new vechicle in the input terminal and check back here for the current counts.
-    """
-    )
-    job_starter = JobStarter(job)
-    await job_starter.setup()
-
-    async with trio.open_nursery() as nursery:
-        await job_starter.start(nursery)
-
-
-async def runner_3():
-    job = Job("vehicle_count")
-
-    reader = SensorReader("sensor-reader", 2, 9000)
-    bridge_stream = job.add_source(reader)
-    counter = VehicleCounter("vehicle-counter", 2, FieldsGrouping())
-    bridge_stream.apply_operator(counter)
-
-    print(
-        """
-    This is a streaming job that counts the number of vehicles from 2 input streams, into 2 counters with Field grouping. 
-    Events of the same type are always routed to the same counter. 
-
-    Enter the type of each new vechicle in the input terminal and check back here for the current counts.
-    """
-    )
-    job_starter = JobStarter(job)
-    await job_starter.setup()
-
-    async with trio.open_nursery() as nursery:
-        await job_starter.start(nursery)
-
-
-def main():
-    trio.run(runner_3)
-
-
-if __name__ == "__main__":
-    main()
+    def apply(trx: TransactionEvent, event_collector: EventCollector):
+        assert isinstance(trx, TransactionEvent)
+        event_collector.add("default", TransactionScoreEvent(trx, 0.0))
