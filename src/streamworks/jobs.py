@@ -29,64 +29,6 @@ class TransactionScoreEvent(Event):
     score: float
 
 
-class AvgTicketAnalyzer(Operator):
-    _instance_id: int
-
-    def __init__(self, name: int, parallelism: int, grouping: GroupingStrategy):
-        super().__init__(name, parallelism, grouping)
-
-    async def setup_instance(self, instance: int):
-        self._instance_id = instance
-
-    def clone(self):
-        return self.__class__(
-            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
-        )
-
-    def apply(trx: Event, event_collector: EventCollector):
-        assert isinstance(
-            trx, TransactionEvent
-        ), f"unfamiliar event of type: {type(trx)}"
-        return TransactionScoreEvent(trx, 0.0)
-
-
-class Bridge(Source):
-    _instance_id: int
-    base_port: int
-    flag_clone: bool
-    stream: trio.SocketStream
-
-    def __init__(self, name: str, parallelism: int, base_port: int, clone: bool):
-        super().__init__(name, parallelism)
-        self.base_port = base_port
-        self.flag_clone = clone
-
-    def clone(self):
-        return self.__class__(
-            self.get_name(), self.get_parallelism(), self.base_port, self.flag_clone
-        )
-
-    async def setup_instance(self, instance_id: int) -> None:
-        self._instance_id = instance_id
-        self.stream = await trio.open_tcp_stream(
-            "127.0.0.1", self.base_port + instance_id
-        )
-
-    async def get_events(self, event_collector: EventCollector):
-        data: bytes = await self.stream.receive_some()
-        if data is None or len(data) == 0:
-            raise trio.BrokenResourceError("\nTCP socket connection is closed")
-
-        vehicle = data.decode("utf-8").strip()
-        event_collector.add("default", VehicleEvent(vehicle))
-        if self.flag_clone:
-            event_collector.add("clone", VehicleEvent(f"{vehicle} clone"))
-
-        print(
-            f"\nBridge ({self.get_name()}) :: instance {self._instance_id} ---> {vehicle}"
-        )
-
-
 class ScoreAggregator(Operator):
     _instance_id: int
     _store: "ScoreStorage"
@@ -132,49 +74,12 @@ class ScoreStorage:
         self.trx_scores[trx] = value
 
 
-class VehicleEvent(Event):
-    type_: str
-
-    def __init__(self, type_: str):
-        self.type_ = type_
-
-    def get_type(self) -> str:
-        return self.type_
-
-
-class TollBooth(Operator):
-    _instance_id: int
-    counts: dict[str, int]
-
-    def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy = None):
-        super().__init__(name, parallelism, grouping)
-        self.counts = dict()
-
-    def clone(self):
-        return self.__class__(
-            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
-        )
-
-    async def setup_instance(self, instance_id: int) -> None:
-        self._instance_id = instance_id
-
-    def apply(self, event: VehicleEvent, event_collector: EventCollector):
-        vehicle = event.get_type()
-        assert isinstance(vehicle, str), "Unexpected vehicle type encountered"
-
-        self.counts[vehicle] = self.counts.get(vehicle, 0) + 1
-        print(
-            f"Toll booth ({self.get_name()}) :: instance {self._instance_id} ==>",
-            end="  ",
-        )
-        for vehicle, count in self.counts.items():
-            print(f"{vehicle}: {count}", end=", ")
-        print("", flush=True)
-
-
 class TransactionFieldsGrouping(FieldsGrouping):
     def get_key(self, event: TransactionScoreEvent):
-        assert isinstance(event, TransactionScoreEvent)
+        if isinstance(event, TransactionEvent):
+            event = TransactionScoreEvent(event, 0)
+        else:
+            assert isinstance(event, TransactionScoreEvent)
         return event.transaction.transaction_id
 
 
@@ -182,12 +87,6 @@ class UserAccountFieldsGrouping(FieldsGrouping):
     def get_key(self, event: TransactionEvent):
         assert isinstance(event, TransactionEvent)
         return event.transaction_id
-
-
-class VehicleTypeFieldsGrouping(FieldsGrouping):
-    def get_key(self, event: VehicleEvent) -> Any:
-        assert isinstance(event, VehicleEvent)
-        return event.get_type()
 
 
 class TransactionSource(Source):
@@ -233,39 +132,57 @@ class TransactionSource(Source):
         )
 
 
-class WindowedProximityAnalyzer(Operator):
+class SystemUsageAnalyzer(Operator):
     _instance_id: int
+    _trx_count: int
+    _fraud_trx_count: int
 
     def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy):
         super().__init__(name, parallelism, grouping)
+        self._trx_count = 0
+        self._fraud_trx_count = 0
+
+    async def setup_instance(self, instance_id: int):
+        self._instance_id = instance_id
 
     def clone(self):
         return self.__class__(
             self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
         )
 
-    async def setup_instance(self, instance_id: int):
-        self._instance_id = instance_id
+    def apply(self, event: Event, event_collector: EventCollector):
+        self._trx_count += 1
+        event_collector.add(
+            "default", UsageEvent(self._trx_count, self._fraud_trx_count)
+        )
 
-    def apply(trx: TransactionEvent, event_collector: EventCollector):
-        assert isinstance(trx, TransactionEvent)
-        event_collector.add("default", TransactionScoreEvent(trx, 0.0))
+
+class UsageEvent(Event):
+    trx_count: int
+    fraud_trx_count: int
+
+    def __init__(self, trx_count: int, fraud_trx_count: int):
+        self.trx_count = trx_count
+        self.fraud_trx_count = fraud_trx_count
+
+    def __repr__(self):
+        return f"[transaction count: {self.trx_count}, fraud transaction count: {self.fraud_trx_count}]"
 
 
-class WindowedTransactionCountAnalyzer(Operator):
+class UsageWriter(Operator):
     _instance_id: int
 
     def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy):
-        super().__init__(name, parallelism, grouping)
+        return super().__init__(name, parallelism, grouping)
+
+    async def setup_instance(self, instance_id: int):
+        self._instance_id = instance_id
 
     def clone(self):
         return self.__class__(
             self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
         )
 
-    async def setup_instance(self, instance_id: int):
-        self._instance_id = instance_id
-
-    def apply(trx: TransactionEvent, event_collector: EventCollector):
-        assert isinstance(trx, TransactionEvent)
-        event_collector.add("default", TransactionScoreEvent(trx, 0.0))
+    def apply(self, score: Event, event_collector: EventCollector):
+        assert isinstance(score, UsageEvent)
+        print(score)
