@@ -27,3 +27,6 @@
   * Hmm, however the problem posed makes sense, you want to see the fraud ratio separately for different transaction id sets. Modeling is using instances of the same executor doesn't make sense however then, since instances are dumb processesors, not meaninfully distinct in a business sense. 
   * Different channels for different trx-id sets maybe? Each channel connected to a different UsageWriter component? 
 
+# Chapter 7
+
+* The windowed operator seems to work okay but I am not convinced it is implemented correctly. 
