@@ -1,8 +1,10 @@
 import uuid
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
+
 import trio
+from colorama import Fore
 
 from .api import *
 from .engine import *
@@ -22,11 +24,35 @@ class TransactionEvent(Event):
     def __repr__(self):
         return f"[transaction:{self.transaction_id}, amount:{self.amount}, time:{self.transaction_time.strftime('%Y-%m-%d %H:%M:%S')}, merchandise: {self.merchandise_id}, user: {self.user_account}]"
 
+    def get_time(self):
+        return int(self.transaction_time.timestamp() * 1000)
+
 
 @dataclass
 class TransactionScoreEvent(Event):
     transaction: TransactionEvent
     score: float
+
+
+class AvgTicketAnalyzer(Operator):
+    _instance_id: int
+
+    def __init__(self, name: int, parallelism: int, grouping: GroupingStrategy):
+        super().__init__(name, parallelism, grouping)
+
+    async def setup_instance(self, instance: int):
+        self._instance_id = instance
+
+    def clone(self):
+        return self.__class__(
+            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
+        )
+
+    def apply(trx: Event, event_collector: EventCollector):
+        assert isinstance(
+            trx, TransactionEvent
+        ), f"unfamiliar event of type: {type(trx)}"
+        return TransactionScoreEvent(trx, 0.0)
 
 
 class ScoreAggregator(Operator):
@@ -116,73 +142,83 @@ class TransactionSource(Source):
         try:
             values = trx.split(",")
             amount = float(values[0])
-            merchandise_id = int(values[1])
+            offset_seconds = int(values[1])
         except:
             warnings.warn(f"Invalid input transaction: {trx}", RuntimeWarning)
             return
 
         user_account = 1
         trx_id = uuid.uuid4().hex
-        trx_time = datetime.now()
-        event = TransactionEvent(trx_id, amount, trx_time, merchandise_id, user_account)
+        trx_time = datetime.now() + timedelta(seconds=offset_seconds)
+        event = TransactionEvent(trx_id, amount, trx_time, -1, user_account)
         event_collector.add("default", event)
 
         print(
-            f"\nTransaction ({self.get_name()}) :: instance {self._instance_id} ---> {event}"
+            Fore.RED
+            + f"\nTransaction ({self.get_name()}) :: instance {self._instance_id} ---> {event}"
         )
 
 
-class SystemUsageAnalyzer(Operator):
+class TestWindowedAnalyzer(WindowOperator):
     _instance_id: int
-    _trx_count: int
-    _fraud_trx_count: int
 
     def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy):
         super().__init__(name, parallelism, grouping)
-        self._trx_count = 0
-        self._fraud_trx_count = 0
-
-    async def setup_instance(self, instance_id: int):
-        self._instance_id = instance_id
 
     def clone(self):
         return self.__class__(
             self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
         )
 
-    def apply(self, event: Event, event_collector: EventCollector):
-        self._trx_count += 1
-        event_collector.add(
-            "default", UsageEvent(self._trx_count, self._fraud_trx_count)
+    async def setup_instance(self, instance_id: int):
+        self._instance_id = instance_id
+
+    def apply(self, window: EventWindow, event_collector: EventCollector):
+        st_time = datetime.fromtimestamp(math.floor(window.get_start_time() / 1000))
+        end_time = datetime.fromtimestamp(math.floor(window.get_end_time() / 1000))
+        print(
+            Fore.GREEN
+            # + f"window id: {id(window)}\n"
+            + f"{len(window.get_events())} transactions were received between {st_time} and {end_time}"
         )
+        for event in window.get_events():
+            print(f"Event: {event}")
+        print("", flush=True)
 
 
-class UsageEvent(Event):
-    trx_count: int
-    fraud_trx_count: int
-
-    def __init__(self, trx_count: int, fraud_trx_count: int):
-        self.trx_count = trx_count
-        self.fraud_trx_count = fraud_trx_count
-
-    def __repr__(self):
-        return f"[transaction count: {self.trx_count}, fraud transaction count: {self.fraud_trx_count}]"
-
-
-class UsageWriter(Operator):
+class WindowedProximityAnalyzer(Operator):
     _instance_id: int
 
     def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy):
-        return super().__init__(name, parallelism, grouping)
-
-    async def setup_instance(self, instance_id: int):
-        self._instance_id = instance_id
+        super().__init__(name, parallelism, grouping)
 
     def clone(self):
         return self.__class__(
             self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
         )
 
-    def apply(self, score: Event, event_collector: EventCollector):
-        assert isinstance(score, UsageEvent)
-        print(score)
+    async def setup_instance(self, instance_id: int):
+        self._instance_id = instance_id
+
+    def apply(trx: TransactionEvent, event_collector: EventCollector):
+        assert isinstance(trx, TransactionEvent)
+        event_collector.add("default", TransactionScoreEvent(trx, 0.0))
+
+
+class WindowedTransactionCountAnalyzer(Operator):
+    _instance_id: int
+
+    def __init__(self, name: str, parallelism: int, grouping: GroupingStrategy):
+        super().__init__(name, parallelism, grouping)
+
+    def clone(self):
+        return self.__class__(
+            self.get_name(), self.get_parallelism(), self.get_grouping_strategy()
+        )
+
+    async def setup_instance(self, instance_id: int):
+        self._instance_id = instance_id
+
+    def apply(trx: TransactionEvent, event_collector: EventCollector):
+        assert isinstance(trx, TransactionEvent)
+        event_collector.add("default", TransactionScoreEvent(trx, 0.0))
