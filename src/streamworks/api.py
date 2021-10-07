@@ -1,7 +1,10 @@
 import time
 import math
 from abc import ABC, abstractmethod
-from typing import Any, Iterable, Protocol, runtime_checkable
+from typing import Any, Iterable, Protocol, runtime_checkable, Union
+
+
+TYPE_GROUPING_MAP = dict[str, "GroupingStrategy"]
 
 
 @runtime_checkable
@@ -111,13 +114,21 @@ class EventWindow:
 
 
 class Operator(Component):
-    grouping: "GroupingStrategy"
+    grouping_map: TYPE_GROUPING_MAP
 
     def __init__(
-        self, name: str, parallelism: int, grouping: "GroupingStrategy" = None
+        self,
+        name: str,
+        parallelism: int,
+        grouping: Union["GroupingStrategy", TYPE_GROUPING_MAP] = None,
     ) -> None:
         super().__init__(name, parallelism)
-        self.grouping = ShuffleGrouping() if not grouping else grouping
+        if isinstance(grouping, dict):
+            self.grouping_map = grouping
+        elif grouping is not None:
+            self.grouping_map = {"default": grouping}
+        else:
+            self.grouping_map = {"default": ShuffleGrouping()}
 
     @abstractmethod
     def clone(self) -> "Operator":
@@ -131,8 +142,11 @@ class Operator(Component):
     def apply(self, event: Event, event_collector: list[Event]):
         pass
 
-    def get_grouping_strategy(self) -> "GroupingStrategy":
-        return self.grouping
+    def get_grouping_strategy(self, stream_name: str) -> "GroupingStrategy":
+        return self.grouping_map[stream_name]
+
+    def get_grouping_strategy_map(self) -> TYPE_GROUPING_MAP:
+        return self.grouping_map
 
 
 class StreamChannel:
@@ -249,7 +263,10 @@ class Job:
         return self._source_set
 
 
+@runtime_checkable
 class GroupingStrategy(Protocol):
+    ALL_INSTANCES: int = -1
+
     def get_instance(self, event: Event, parallelism: int) -> int:
         pass
 
@@ -274,6 +291,11 @@ class ShuffleGrouping:
             self.count = 0
         self.count += 1
         return self.count - 1
+
+
+class AllGrouping:
+    def get_instance(self, event: Event, parallelism: int) -> int:
+        return GroupingStrategy.ALL_INSTANCES
 
 
 @runtime_checkable
@@ -406,3 +428,44 @@ class WindowingOperator(Operator):
 
         for window in self._strategy.get_event_windows(processing_time):
             self._operator.apply(window, event_collector)
+
+
+class JoinOperator(Operator):
+    default_grouping: "GroupingStrategy"
+
+    def __init__(self, name: str, parallelism: int, grouping_map: TYPE_GROUPING_MAP):
+        super().__init__(name, parallelism, grouping_map)
+        self.default_grouping = AllGrouping()
+
+    def get_grouping_strategy(self, stream_name: str) -> "GroupingStrategy":
+        return self.grouping_map.get(stream_name, self.default_grouping)
+
+
+class NamedStreams:
+    _streams: dict[Stream, str]
+
+    def __init__(self, named_streams: dict[Stream, str]):
+        self._streams = named_streams
+
+    def join(self, operator: JoinOperator) -> Stream:
+        for stream, name in self._streams.items():
+            stream.apply_operator(operator, name)
+        return operator.get_outgoing_stream()
+
+
+class NameEventPair:
+    _stream_name: str
+    _event: Event
+
+    def __init__(self, stream_name: str, event: Event):
+        self._stream_name = stream_name
+        self._event = event
+
+    def get_stream_name(self):
+        return self._stream_name
+
+    def get_event(self):
+        return self._event
+
+    def __repr__(self):
+        return f"[stream name: {self._stream_name}, event: {self._event}]"

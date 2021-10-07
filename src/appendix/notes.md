@@ -30,3 +30,7 @@
 # Chapter 7
 
 * The windowed operator seems to work okay but I am not convinced it is implemented correctly. 
+
+# Chapter 8
+
+* There is now also the concept of a stream out of a Strem besides a channel. Pretty confusing, left midway. 
